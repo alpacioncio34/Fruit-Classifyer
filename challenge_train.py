@@ -19,15 +19,14 @@ TRAIN_DATA_DIR = "dataset/train/"
 VAL_DATA_DIR = "dataset/val/"
 BATCH_SIZE = 64
 KERNEL_SIZE = 3
-EPOCH_NUM = 20
+EPOCH_NUM = 150
 CLASSES = ["apple","avocado","banana","cherry","kiwi","mango","orange","pineaple","strawberry","watermelon"]
 USE_GPU = True
 LR = 0.001 # Default:0.001
-REGULARIZATION_TYPE = "L2"
 LAMBDA_REG = 0.01
 # Calculated through commented code in datatrain
-MEAN = [ 0.3198, 0.1987,-0.0664]
-STD = [0.6254,0.6163, 0.7165]
+MEAN = [0.6492, 0.5511, 0.402 ]
+STD = [0.2646, 0.2748, 0.3047]
 
 train_transform = v2.Compose([
     v2.ToImage(),
@@ -68,11 +67,15 @@ class Net(torch.nn.Module):
 
         DONE: Batch Normalization
 
-        TODO: Applying transforms in order for the model to see different versions of each image in each epoch, a few randomized transformations
+        DONE: Applying transforms in order for the model to see different versions of each image in each epoch, a few randomized transformations
 
-        TODO: Adding dropout at the end of the convolutional layers, might not work perfectly
+        DONE: Adding dropout at the end of the convolutional layers, might not work perfectly
+
+        TODO: Keep trying weight decay parameters and epochs with higher decay
 
         TODO: Searching for a similar model and applying transfer learning instead of training the CNN from scratch
+
+        TODO: Look for claude's proposed architecture
 
         After everything here is done and tested, I will report the networks performance increase.
 
@@ -80,10 +83,11 @@ class Net(torch.nn.Module):
         the main ones that are a must are the TODOs from above.
     '''
 
-    def __init__(self):
+    def __init__(self,drop_prob = 0.0):
         super().__init__()
 
         # Here we define the layers, that will later be executed in forward
+        self.drop_prob = drop_prob
         self.conv1 = torch.nn.Conv2d(
             kernel_size=KERNEL_SIZE,
             in_channels=3,
@@ -119,13 +123,13 @@ class Net(torch.nn.Module):
             padding="same"
         )
         self.bn5 = torch.nn.BatchNorm2d(32)
+        self.dropout = torch.nn.Dropout(p=0.4)
         self.classifier = torch.nn.Sequential(
             torch.nn.Flatten(),
             #PrintSize(),
             torch.nn.Dropout(0.3),
             torch.nn.Linear(128, len(CLASSES)),
         )
-
         self.avg_pool = torch.nn.AdaptiveAvgPool2d((1, 1))
 
     def forward(self,x):
@@ -152,6 +156,7 @@ class Net(torch.nn.Module):
         x = self.bn5(x)
 
         # Classifier layer
+        x = self.dropout(x)
         x = self.classifier(x)
         return x
 
@@ -171,18 +176,28 @@ class Trainer(Test):
     
     
     def create_transform(self, inference=True):
-        # What we do with the data before feeding it to the neural network
-        return torchvision.transforms.Compose([
-            v2.ToImage(),
-            v2.Resize(16),
-            v2.CenterCrop(16),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=MEAN, std=STD),
-        ])
+        if inference:
+            return eval_transform
+        return train_transform
     
 
     def save_model(self, model):
         torch.save(model.state_dict(), "model.torch")
+
+    def compute_stats(self):
+        # COMPUTING MEAN AND STD
+        plain = v2.Compose([
+            v2.ToImage(),
+            v2.Resize(16),
+            v2.CenterCrop(16),
+            v2.ToDtype(torch.float32, scale=True),   # no Normalization
+        ])
+        data = torchvision.datasets.ImageFolder(root=TRAIN_DATA_DIR, transform=plain)
+        loader = torch.utils.data.DataLoader(data, batch_size=len(data), shuffle=False)
+        X, _ = next(iter(loader))
+        X = X.numpy()
+        print("mean:", X.mean(axis=(0, 2, 3)).round(4))
+        print("std:", X.std(axis=(0, 2, 3)).round(4))
 
     def dataloaders(self):
         train_data = torchvision.datasets.ImageFolder(root=TRAIN_DATA_DIR,transform=train_transform)
@@ -190,24 +205,14 @@ class Trainer(Test):
 
         train_dataloader = torch.utils.data.DataLoader(train_data,batch_size=BATCH_SIZE,shuffle=True,num_workers=2)
         val_dataloader = torch.utils.data.DataLoader(val_data,batch_size=BATCH_SIZE,shuffle=True,num_workers=2)
-        '''
-        X, _ = next(iter(train_dataloader))          # X: [N, 3, 16, 16]
-        X = X.numpy()
-
-        mean = X.mean(axis=(0, 2, 3))
-        std = X.std(axis=(0, 2, 3))
-
-        print("mean:", mean.round(4))
-        print("std:", std.round(4))
-        '''
 
         return train_data,val_data,train_dataloader,val_dataloader
 
 
-    def train_model(self, model,epoch_num,use_gpu,dataloader_train,regularization_type):
+    def train_model(self, model,epoch_num,use_gpu,dataloader_train):
 
         # Defining optimizer and loss
-        optimizer = torch.optim.Adam(model.parameters(),lr=LR)
+        optimizer = torch.optim.Adam(model.parameters(),lr=LR,weight_decay=5e-2)
         loss = torch.nn.CrossEntropyLoss()
 
         # move to GPU if GPU is available
@@ -241,16 +246,6 @@ class Trainer(Test):
                 # change parameters of the network
                 optimizer.step()
 
-                    # Apply L1 regularization
-                if regularization_type == 'L1':
-                    l1_norm = sum(p.abs().sum() for p in model.parameters())
-                    L += LAMBDA_REG * l1_norm
-                
-                # Apply L2 regularization
-                elif regularization_type == 'L2':
-                    l2_norm = sum(p.pow(2).sum() for p in model.parameters())
-                    L += LAMBDA_REG * l2_norm
-
                 # L is the mean over the batch, so weight it by the batch size
                 train_loss += L.item() * len(x)
                 train_correct += (y_pred.argmax(dim=1) == y).sum().item()
@@ -268,12 +263,14 @@ if __name__ == "__main__":
     trainer = Trainer() 
     model = trainer.create_model()
 
+    # trainer.compute_stats()
+
     _,_,dataloader_train,_ = trainer.dataloaders()
 
     # print(f"Uno: {len(dataloader_train)}")
     # print(f"Dos: {len(dataloader_train.dataset)}")
 
-    model = trainer.train_model(model=model,epoch_num=EPOCH_NUM,use_gpu=USE_GPU,dataloader_train=dataloader_train,regularization_type=REGULARIZATION_TYPE)
+    model = trainer.train_model(model=model,epoch_num=EPOCH_NUM,use_gpu=USE_GPU,dataloader_train=dataloader_train)
 
     num_par = sum([torch.prod(torch.tensor(p.shape)) for p in model.parameters()]).item()
 
