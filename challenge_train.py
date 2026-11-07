@@ -25,15 +25,29 @@ USE_GPU = True
 LR = 0.001 # Default:0.001
 REGULARIZATION_TYPE = "L2"
 LAMBDA_REG = 0.01
+# Calculated through commented code in datatrain
+MEAN = [ 0.3198, 0.1987,-0.0664]
+STD = [0.6254,0.6163, 0.7165]
 
-transform = torchvision.transforms.Compose([
-            v2.CenterCrop(16),
-            torchvision.transforms.ToTensor(),
-            v2.Normalize(
-               mean = (0.5, 0.5, 0.5),
-               std = (1.0, 1.0, 1.0)
-            )
-        ])
+train_transform = v2.Compose([
+    v2.ToImage(),
+    v2.Resize(16),
+    v2.CenterCrop(16),
+    v2.RandomCrop(16, padding=2, padding_mode='reflect'),
+    v2.RandomHorizontalFlip(p=0.5),
+    v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=MEAN, std=STD),   # computed from training set
+    v2.RandomErasing(p=0.25, scale=(0.02, 0.1)),  # optional, small patches
+])
+
+eval_transform = v2.Compose([
+    v2.ToImage(),
+    v2.Resize(16),
+    v2.CenterCrop(16),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=MEAN, std=STD),
+])
 
 # Debugging class for sizes
 class PrintSize(torch.nn.Module):
@@ -159,12 +173,11 @@ class Trainer(Test):
     def create_transform(self, inference=True):
         # What we do with the data before feeding it to the neural network
         return torchvision.transforms.Compose([
+            v2.ToImage(),
+            v2.Resize(16),
             v2.CenterCrop(16),
-            torchvision.transforms.ToTensor(),
-            v2.Normalize(
-               mean = (0.5, 0.5, 0.5),
-               std = (1.0, 1.0, 1.0)
-            )
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize(mean=MEAN, std=STD),
         ])
     
 
@@ -172,11 +185,21 @@ class Trainer(Test):
         torch.save(model.state_dict(), "model.torch")
 
     def dataloaders(self):
-        train_data = torchvision.datasets.ImageFolder(root=TRAIN_DATA_DIR,transform=transform)
-        val_data = torchvision.datasets.ImageFolder(root=VAL_DATA_DIR,transform=transform)
+        train_data = torchvision.datasets.ImageFolder(root=TRAIN_DATA_DIR,transform=train_transform)
+        val_data = torchvision.datasets.ImageFolder(root=VAL_DATA_DIR,transform=eval_transform)
 
         train_dataloader = torch.utils.data.DataLoader(train_data,batch_size=BATCH_SIZE,shuffle=True,num_workers=2)
         val_dataloader = torch.utils.data.DataLoader(val_data,batch_size=BATCH_SIZE,shuffle=True,num_workers=2)
+        '''
+        X, _ = next(iter(train_dataloader))          # X: [N, 3, 16, 16]
+        X = X.numpy()
+
+        mean = X.mean(axis=(0, 2, 3))
+        std = X.std(axis=(0, 2, 3))
+
+        print("mean:", mean.round(4))
+        print("std:", std.round(4))
+        '''
 
         return train_data,val_data,train_dataloader,val_dataloader
 
