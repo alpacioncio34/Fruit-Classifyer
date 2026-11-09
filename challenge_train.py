@@ -19,7 +19,7 @@ TRAIN_DATA_DIR = "dataset/train/"
 VAL_DATA_DIR = "dataset/val/"
 BATCH_SIZE = 64
 KERNEL_SIZE = 3
-EPOCH_NUM = 150
+EPOCH_NUM = 300
 CLASSES = ["apple","avocado","banana","cherry","kiwi","mango","orange","pineaple","strawberry","watermelon"]
 USE_GPU = True
 LR = 0.001 # Default:0.001
@@ -72,8 +72,6 @@ class Net(torch.nn.Module):
         DONE: Adding dropout at the end of the convolutional layers, might not work perfectly
 
         TODO: Keep trying weight decay parameters and epochs with higher decay
-
-        TODO: Searching for a similar model and applying transfer learning instead of training the CNN from scratch
 
         TODO: Look for claude's proposed architecture
 
