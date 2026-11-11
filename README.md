@@ -110,3 +110,38 @@ Almost all the budget goes into the convolutions that learn features, and almost
 ## Summary
 
 A miniature ResNet: a wide-enough stem so no information is lost early, two residual blocks that refine features while pooling builds up a global view, and a cheap, position-invariant classifier, with stochastic depth and dropout to keep such a small model from memorizing the training set.
+
+# Next steps
+Now train acc is 80% while val ac is 65 %, we do not want more regularization because after testing a lot we can see that it lowers the training accuracy withour lifting up our validation accuracy, so right now the main idea is to use all of the computation time we have (1 hour), right now, the training takes only a few minutes and the outcome does not vary when adding more epochs or more regularization by increasing the weight decay from the adamW optimizer.
+
+## New approach
+We will improve what the Net learns without making the training harder.
+
+### Step 1: Measure properly
+Checking for validation acc in each epoch and keeping the best epoch, not the last one.
+
+### Step 2: 
+Most of your epoch time is probably spent decoding and resizing image files, not training. The deterministic part of your transform (resize, centre crop) gives the same result every time, so compute it once, keep the 16×16 tensors in memory, and apply only the random part per epoch. This is what turns one hour into many experiments.
+
+### Step 3: fix the optimisation
+Decay the learning rate. With a constant LR the weights keep bouncing around at the end. Look up cosine annealing with a short warmup.
+Average the weights. An exponential moving average (EMA) of the weights over training usually generalises better than the final weights. Evaluate both and compare.
+Then train longer, since the schedule now ends cleanly.
+
+### Step 4: knowledge distillation
+
+This is the technique built for your situation: a tiny model with compute to spare.
+
+A large teacher (for example an ImageNet-pretrained network looking at your images at high resolution) classifies your training images.
+Your small student is trained to match the teacher’s full probability distribution as well as the true label.
+Those “soft labels” carry more information than one-hot labels, such as “this mango looks a bit like an orange”, and that helps a small net generalise.
+
+Things to read about and get right: temperature, the weighting between the two losses, and the fact that a teacher which has memorised your training set has nothing to teach (so its predictions should come from data it wasn’t trained on). Check that your challenge rules allow a pretrained teacher.
+
+### Step 5: spend the parameter budget better
+
+Only once the above is done. Ideas to study: depthwise-separable convolutions (more width or depth for the same parameters), and whether your second max-pool before the global average pool is discarding useful information.
+
+### Cheap extras for the end
+Test-time augmentation: average the predictions for an image and its mirror.
+Train on train+val for the final submission, once all settings are fixed.

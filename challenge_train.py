@@ -34,12 +34,12 @@ train_transform = v2.Compose([
     v2.Resize(16),
     v2.CenterCrop(16),
     v2.RandomCrop(16, padding=2, padding_mode='reflect'),
-    v2.RandomHorizontalFlip(p=0.4),
+    v2.RandomHorizontalFlip(p=0.5),
     v2.RandomResizedCrop(16, scale=(0.85, 1.0), ratio=(0.9, 1.1), antialias=True),
     v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=MEAN, std=STD),   # computed from training set
-    v2.RandomErasing(p=0.5, scale=(0.02, 0.1)),  # optional, small patches
+    # v2.RandomErasing(p=0.5, scale=(0.02, 0.1)),  # optional, small patches
 ])
 
 '''
@@ -143,7 +143,7 @@ class Trainer(Test):
 
 
     def create_model(self):
-        return Net(sd_prob=0.1,dropout=0.2)
+        return Net(sd_prob=0.1,dropout=0.0)
     
     
     def create_transform(self, inference=True):
