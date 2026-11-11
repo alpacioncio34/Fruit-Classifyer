@@ -18,9 +18,9 @@ from torchvision.ops import StochasticDepth
 # VARIABLES DEFINITION
 TRAIN_DATA_DIR = "dataset/train/"
 VAL_DATA_DIR = "dataset/val/"
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 KERNEL_SIZE = 3
-EPOCH_NUM = 200
+EPOCH_NUM = 250
 CLASSES = ["apple","avocado","banana","cherry","kiwi","mango","orange","pineaple","strawberry","watermelon"]
 USE_GPU = True
 LR = 0.001 # Default:0.001
@@ -34,12 +34,28 @@ train_transform = v2.Compose([
     v2.Resize(16),
     v2.CenterCrop(16),
     v2.RandomCrop(16, padding=2, padding_mode='reflect'),
-    v2.RandomHorizontalFlip(p=0.6),
+    v2.RandomHorizontalFlip(p=0.4),
+    v2.RandomResizedCrop(16, scale=(0.85, 1.0), ratio=(0.9, 1.1), antialias=True),
     v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=MEAN, std=STD),   # computed from training set
     v2.RandomErasing(p=0.5, scale=(0.02, 0.1)),  # optional, small patches
 ])
+
+'''
+train_transform = v2.Compose([
+    v2.ToImage(),
+    v2.Resize(16),
+    v2.CenterCrop(16), # Not all images are squared
+    v2.RandomResizedCrop(16, scale=(0.6, 1.0), ratio=(0.85, 1.15), antialias=True),
+    v2.RandomAffine(degrees=10, translate=(0.1, 0.1)),
+    v2.RandomHorizontalFlip(0.5),  
+    v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=MEAN, std=STD),
+    v2.RandomErasing(p=0.5, scale=(0.02, 0.2), value=0),
+])
+'''
 
 eval_transform = v2.Compose([
     v2.ToImage(),
@@ -167,7 +183,7 @@ class Trainer(Test):
     def train_model(self, model,epoch_num,use_gpu,dataloader_train):
 
         # Defining optimizer and loss
-        optimizer = torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=5e-4)
+        optimizer = torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=5e-2)
         loss = torch.nn.CrossEntropyLoss()
 
         # move to GPU if GPU is available
