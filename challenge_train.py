@@ -11,15 +11,16 @@ import torch, torchvision, torchvision.transforms.v2 as v2
 import numpy as np
 import time
 import tqdm
+from torchvision.ops import StochasticDepth
 
 
 
 # VARIABLES DEFINITION
 TRAIN_DATA_DIR = "dataset/train/"
 VAL_DATA_DIR = "dataset/val/"
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 KERNEL_SIZE = 3
-EPOCH_NUM = 300
+EPOCH_NUM = 250
 CLASSES = ["apple","avocado","banana","cherry","kiwi","mango","orange","pineaple","strawberry","watermelon"]
 USE_GPU = True
 LR = 0.001 # Default:0.001
@@ -34,11 +35,27 @@ train_transform = v2.Compose([
     v2.CenterCrop(16),
     v2.RandomCrop(16, padding=2, padding_mode='reflect'),
     v2.RandomHorizontalFlip(p=0.5),
+    v2.RandomResizedCrop(16, scale=(0.85, 1.0), ratio=(0.9, 1.1), antialias=True),
     v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=MEAN, std=STD),   # computed from training set
-    v2.RandomErasing(p=0.25, scale=(0.02, 0.1)),  # optional, small patches
+    # v2.RandomErasing(p=0.5, scale=(0.02, 0.1)),  # optional, small patches
 ])
+
+'''
+train_transform = v2.Compose([
+    v2.ToImage(),
+    v2.Resize(16),
+    v2.CenterCrop(16), # Not all images are squared
+    v2.RandomResizedCrop(16, scale=(0.6, 1.0), ratio=(0.85, 1.15), antialias=True),
+    v2.RandomAffine(degrees=10, translate=(0.1, 0.1)),
+    v2.RandomHorizontalFlip(0.5),  
+    v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=MEAN, std=STD),
+    v2.RandomErasing(p=0.5, scale=(0.02, 0.2), value=0),
+])
+'''
 
 eval_transform = v2.Compose([
     v2.ToImage(),
@@ -54,115 +71,71 @@ class PrintSize(torch.nn.Module):
         print(f"The size after flattening is: {x.shape}")
         return x
 
+class ResBlock(torch.nn.Module):
+    def __init__(self, in_ch, out_ch, sd_prob):
+        super().__init__()
+        self.conv1 = torch.nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
+        self.bn1 = torch.nn.BatchNorm2d(out_ch)
+        self.conv2 = torch.nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.bn2 = torch.nn.BatchNorm2d(out_ch)
+        if in_ch != out_ch:
+            self.shortcut = torch.nn.Sequential(
+                torch.nn.Conv2d(in_ch, out_ch, 1, bias=False),
+                torch.nn.BatchNorm2d(out_ch),
+            )
+        else:
+            self.shortcut = torch.nn.Identity()
+        self.sd = StochasticDepth(p=sd_prob, mode="row")
+
+    def forward(self, x):
+        out = torch.nn.functional.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.shortcut(x) + self.sd(out)   # only the residual branch can be dropped
+        return torch.nn.functional.relu(out)
+
+
 class Net(torch.nn.Module):
 
     '''
-        CURRENT STATE OF THE NETWORK: UNACCEPTABLE:
+        NEW ARCHITECTURE DESIGN: Mini-RESNET
 
-        The model overfits even in the validation data (easier than the testing data) 40% val and 25% test acc.
-
-        I propose using several techniques
-
-        DONE: Image normalization
-
-        DONE: Batch Normalization
-
-        DONE: Applying transforms in order for the model to see different versions of each image in each epoch, a few randomized transformations
-
-        DONE: Adding dropout at the end of the convolutional layers, might not work perfectly
-
-        TODO: Keep trying weight decay parameters and epochs with higher decay
-
-        TODO: Look for claude's proposed architecture
-
-        After everything here is done and tested, I will report the networks performance increase.
-
-        There are also other ideas to test, for example increasing the dataset by manually creating transformed images of the categories, but
-        the main ones that are a must are the TODOs from above.
+        The idea is to spend a tiny parameter budget as efficiently as possible: keep enough channels from the start to avoid losing information,
+        reuse the same width throughout, and use residual connections so the network trains easily and can be regularized with stochastic depth.
     '''
 
-    def __init__(self,drop_prob = 0.0):
+    def __init__(self,dropout=0.2,sd_prob=0.1):
         super().__init__()
 
-        # Here we define the layers, that will later be executed in forward
-        self.drop_prob = drop_prob
-        self.conv1 = torch.nn.Conv2d(
-            kernel_size=KERNEL_SIZE,
-            in_channels=3,
-            out_channels=2,
-            padding="same")
-        self.bn2 = torch.nn.BatchNorm2d(4)
+        self.stem = torch.nn.Sequential(
+            torch.nn.Conv2d(3,16,3,padding=1,bias=False),
+            torch.nn.BatchNorm2d(16),
+            torch.nn.ReLU(),
+        )
 
-        self.pool = torch.nn.MaxPool2d(kernel_size=2,stride=2)
+        self.block1 = ResBlock(16,16,sd_prob/2) 
 
-        self.conv2 = torch.nn.Conv2d(
-            kernel_size=KERNEL_SIZE,
-            in_channels=2,
-            out_channels=4,
-            padding="same")
-        self.conv3 = torch.nn.Conv2d(
-            kernel_size=KERNEL_SIZE,
-            in_channels=4,
-            out_channels=8,
-            padding="same"
-        )
-        self.bn3 = torch.nn.BatchNorm2d(8)
-        self.conv4 = torch.nn.Conv2d(
-            kernel_size=KERNEL_SIZE,
-            in_channels=8,
-            out_channels=16,
-            padding="same"
-        )
-        self.bn4 = torch.nn.BatchNorm2d(16)
-        self.conv5 = torch.nn.Conv2d(
-            kernel_size=KERNEL_SIZE,
-            in_channels=16,
-            out_channels=32,
-            padding="same"
-        )
-        self.bn5 = torch.nn.BatchNorm2d(32)
-        self.dropout = torch.nn.Dropout(p=0.4)
+        self.block2 = ResBlock(16,16,sd_prob)
+
+        self.pool = torch.nn.MaxPool2d(2)
+
         self.classifier = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d(1),
             torch.nn.Flatten(),
-            #PrintSize(),
-            torch.nn.Dropout(0.3),
-            torch.nn.Linear(128, len(CLASSES)),
-        )
-        self.avg_pool = torch.nn.AdaptiveAvgPool2d((1, 1))
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(16,len(CLASSES))
+        )       
 
     def forward(self,x):
-        x = self.conv1(x)
-        x = torch.nn.functional.relu(x)
+        x = self.stem(x)
 
-        x = self.conv2(x)
-        x = torch.nn.functional.relu(x)
-        x = self.bn2(x)
+        x = self.pool(self.block1(x))
 
-        x = self.conv3(x)
-        x = torch.nn.functional.relu(x)
-        x = self.pool(x)
-        x = self.bn3(x)
+        x = self.pool(self.block2(x))
 
-        x = self.conv4(x)
-        x = torch.nn.functional.relu(x)
-        x = self.pool(x)
-        x = self.bn4(x)
-
-        x = self.conv5(x)
-        x = torch.nn.functional.relu(x)
-        x = self.pool(x)
-        x = self.bn5(x)
-
-        # Classifier layer
-        x = self.dropout(x)
         x = self.classifier(x)
+
         return x
-
-    def reset_parameters(self):
-        self.conv1.reset_parameters()
-        self.conv2.reset_parameters()
-        self.conv3.reset_parameters()
-
+    
 class Trainer(Test):
     
     def __init__(self):
@@ -170,7 +143,7 @@ class Trainer(Test):
 
 
     def create_model(self):
-        return Net()
+        return Net(sd_prob=0.1,dropout=0.0)
     
     
     def create_transform(self, inference=True):
@@ -210,14 +183,12 @@ class Trainer(Test):
     def train_model(self, model,epoch_num,use_gpu,dataloader_train):
 
         # Defining optimizer and loss
-        optimizer = torch.optim.Adam(model.parameters(),lr=LR,weight_decay=5e-2)
+        optimizer = torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=5e-2)
         loss = torch.nn.CrossEntropyLoss()
 
         # move to GPU if GPU is available
         if use_gpu and torch.cuda.is_available():
             model = model.cuda()
-
-        model.reset_parameters()
 
         time_start = time.time()
         epochs = epoch_num
