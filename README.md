@@ -120,7 +120,7 @@ We will improve what the Net learns without making the training harder.
 ### Step 1: Measure properly
 Checking for validation acc in each epoch and keeping the best epoch, not the last one.
 
-### Step 2: 
+### Step 2: Time inversion in data pre-processing
 Most of your epoch time is probably spent decoding and resizing image files, not training. The deterministic part of your transform (resize, centre crop) gives the same result every time, so compute it once, keep the 16×16 tensors in memory, and apply only the random part per epoch. This is what turns one hour into many experiments.
 
 ### Step 3: fix the optimisation
