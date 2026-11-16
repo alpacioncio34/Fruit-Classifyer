@@ -123,7 +123,7 @@ Checking for validation acc in each epoch and keeping the best epoch, not the la
 ### Step 2: Cacheing data preprocessing (Perhaps this does not better our performance but gives us more time)
 Most of your epoch time is probably spent decoding and resizing image files, not training. The deterministic part of your transform (resize, centre crop) gives the same result every time, so compute it once, keep the 16×16 tensors in memory, and apply only the random part per epoch. This is what turns one hour into many experiments.
 
-### Step 3: fix the optimization
+### Step 3: fix the optimization:
 Decay the learning rate. With a constant LR the weights keep bouncing around at the end. Look up cosine annealing with a short warmup.
 Average the weights. An exponential moving average (EMA) of the weights over training usually generalises better than the final weights. Evaluate both and compare.
 Then train longer, since the schedule now ends cleanly.

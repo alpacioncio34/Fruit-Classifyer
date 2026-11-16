@@ -13,6 +13,7 @@ import time
 import tqdm
 from torchvision.ops import StochasticDepth
 import copy
+import math
 
 
 
@@ -23,7 +24,7 @@ VAL_DATA_DIR = "dataset/val/"
 BATCH_SIZE = 128
 KERNEL_SIZE = 3
 EPOCH_NUM = 250
-CLASSES = ["apple","avocado","banana","cherry","kiwi","mango","orange","pineaple","strawberry","watermelon"]
+CLASSES = ["apple","avocado","banana","cherry","kiwi","mango","orange","pineapple","strawberry","watermelon"]
 USE_GPU = True
 LR = 0.001 # Default:0.001
 LAMBDA_REG = 0.01
@@ -35,7 +36,6 @@ train_transform = v2.Compose([
     v2.ToImage(),
     v2.Resize(16),
     v2.CenterCrop(16),
-    v2.RandomCrop(16, padding=2, padding_mode='reflect'),
     v2.RandomHorizontalFlip(p=0.5),
     v2.RandomResizedCrop(16, scale=(0.85, 1.0), ratio=(0.9, 1.1), antialias=True),
     v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
@@ -145,7 +145,7 @@ class Trainer(Test):
 
 
     def create_model(self):
-        return Net(sd_prob=0.1,dropout=0.0)
+        return Net(sd_prob=0.1,dropout=0.2)
     
     
     def create_transform(self, inference=True):
@@ -185,7 +185,30 @@ class Trainer(Test):
     def train_model(self, model,epoch_num,use_gpu,dataloader_train,dataloader_val):
 
         # Defining optimizer and loss
-        optimizer = torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=5e-2)
+        decay, no_decay = [], []
+        for p in model.parameters():
+            if not p.requires_grad:
+                continue
+            (no_decay if p.ndim <= 1 else decay).append(p)
+
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": decay,    "weight_decay": 5e-2},
+                {"params": no_decay, "weight_decay": 0.0},
+            ],
+            lr=LR,
+        )
+        steps_per_epoch = len(dataloader_train)
+        total_steps = epoch_num * steps_per_epoch
+        warm = max(1, int(0.03 * total_steps))      # 3 % of training for warmup
+
+        def lr_lambda(step):
+            if step < warm:
+                return (step + 1) / warm            # LR rises from ~0 to LR
+            p = (step - warm) / max(1, total_steps - warm)
+            return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * p))   # LR falls to 1 % of LR
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         loss = torch.nn.CrossEntropyLoss()
 
         # move to GPU if GPU is available
@@ -223,6 +246,7 @@ class Trainer(Test):
                 L.backward()
                 # change parameters of the network
                 optimizer.step()
+                scheduler.step()
 
                 # L is the mean over the batch, so weight it by the batch size
                 train_loss += L.item() * len(x)
@@ -251,6 +275,8 @@ class Trainer(Test):
                 best_model_weights = copy.deepcopy(model.state_dict())
 
             # some output
+            print(f"[{epoch:>2}] Train accuracy: {train_acc:.5f}")
+            print(f"[{epoch:>2}] Validation accuracy: {val_acc:.5f}")
             print(f"[{epoch:>2}] Train loss: {train_loss:.5f}")
             print(f"[{epoch:>2}] Validation loss: {val_loss:.5f}")
             time_past = time.time() - time_start
@@ -258,8 +284,8 @@ class Trainer(Test):
             eta = (epochs-1-epoch) * time_per_epoch
             print(f"[{epoch:>2}] Time: {time_past:.1f}s, Time-per-Epoch: {time_per_epoch:.1f}s, eta: {eta:.1f}s")
 
-        best_model = model.load_state_dict(best_model_weights)
-        return best_model
+        model.load_state_dict(best_model_weights)
+        return model
     
 if __name__ == "__main__":
     trainer = Trainer() 
