@@ -11,7 +11,11 @@ import torch, torchvision, torchvision.transforms.v2 as v2
 import numpy as np
 import time
 import tqdm
+<<<<<<< HEAD
 from torchvision.ops import StochasticDepth
+=======
+import copy
+>>>>>>> 4550722 (feat: Proposal task 1)
 
 
 
@@ -180,7 +184,7 @@ class Trainer(Test):
         return train_data,val_data,train_dataloader,val_dataloader
 
 
-    def train_model(self, model,epoch_num,use_gpu,dataloader_train):
+    def train_model(self, model,epoch_num,use_gpu,dataloader_train,dataloader_val):
 
         # Defining optimizer and loss
         optimizer = torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=5e-2)
@@ -193,9 +197,16 @@ class Trainer(Test):
         time_start = time.time()
         epochs = epoch_num
 
+        best_val_acc = -1.0
+        best_model_weights = copy.deepcopy(model.state_dict())
+
         for epoch in tqdm.trange(epochs):
             train_loss = 0
-            train_correct = 0
+            train_acc = 0
+            val_loss = 0
+            val_acc = 0
+            train_acc = 0
+            val_acc = 0
 
             model.train()  # training mode (matters for layers such as dropout or batch norm)
             for x, y in dataloader_train:
@@ -217,29 +228,53 @@ class Trainer(Test):
 
                 # L is the mean over the batch, so weight it by the batch size
                 train_loss += L.item() * len(x)
-                train_correct += (y_pred.argmax(dim=1) == y).sum().item()
+                train_acc += (y_pred.argmax(dim=1) == y).sum().item()
+
+            # Val evaluation in order to obtain the best model, not the last one
+            model.eval()
+            with torch.no_grad():
+                for x,y in dataloader_val:
+                    optimizer.zero_grad()
+                    # Move to GPU if GPU is available
+                    if use_gpu and torch.cuda.is_available():
+                        x = x.cuda()
+                        y = y.cuda()
+
+                    y_pred = model(x)
+                    L = loss(y_pred,y)
+                    # Note: NO l.backward or optimizer.step since we are just using the model, not training it
+
+                    # L is the mean over the batch, so we weight is by the batch size
+                    val_loss += L.item() * len(x)
+                    val_acc += (y_pred.argmax(dim=1) == y).sum().item()
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_weights = copy.deepcopy(model.state_dict())
 
             # some output
             print(f"[{epoch:>2}] Train loss: {train_loss:.5f}")
+            print(f"[{epoch:>2}] Validation loss: {val_loss:.5f}")
             time_past = time.time() - time_start
             time_per_epoch = time_past / (epoch+1)
             eta = (epochs-1-epoch) * time_per_epoch
             print(f"[{epoch:>2}] Time: {time_past:.1f}s, Time-per-Epoch: {time_per_epoch:.1f}s, eta: {eta:.1f}s")
 
-        return model
-
+        best_model = model.load_state_dict(best_model_weights)
+        return best_model
+    
 if __name__ == "__main__":
     trainer = Trainer() 
     model = trainer.create_model()
 
     # trainer.compute_stats()
 
-    _,_,dataloader_train,_ = trainer.dataloaders()
+    _,_,dataloader_train,dataloader_val = trainer.dataloaders()
 
     # print(f"Uno: {len(dataloader_train)}")
     # print(f"Dos: {len(dataloader_train.dataset)}")
 
-    model = trainer.train_model(model=model,epoch_num=EPOCH_NUM,use_gpu=USE_GPU,dataloader_train=dataloader_train)
+    model = trainer.train_model(model=model,epoch_num=EPOCH_NUM,use_gpu=USE_GPU,dataloader_train=dataloader_train,dataloader_val=dataloader_val)
 
     num_par = sum([torch.prod(torch.tensor(p.shape)) for p in model.parameters()]).item()
 
