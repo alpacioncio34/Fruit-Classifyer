@@ -11,11 +11,9 @@ import torch, torchvision, torchvision.transforms.v2 as v2
 import numpy as np
 import time
 import tqdm
-<<<<<<< HEAD
 from torchvision.ops import StochasticDepth
-=======
 import copy
->>>>>>> 4550722 (feat: Proposal task 1)
+
 
 
 
