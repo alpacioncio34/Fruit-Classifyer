@@ -219,6 +219,7 @@ class Trainer(Test):
         epochs = epoch_num
 
         best_val_acc = -1.0
+        best_epoch = -1
         best_model_weights = copy.deepcopy(model.state_dict())
 
         for epoch in tqdm.trange(epochs):
@@ -252,6 +253,9 @@ class Trainer(Test):
                 train_loss += L.item() * len(x)
                 train_acc += (y_pred.argmax(dim=1) == y).sum().item()
 
+            train_loss/=len(dataloader_train)
+            train_acc /= len(dataloader_train)
+
             # Val evaluation in order to obtain the best model, not the last one
             model.eval()
             with torch.no_grad():
@@ -270,11 +274,17 @@ class Trainer(Test):
                     val_loss += L.item() * len(x)
                     val_acc += (y_pred.argmax(dim=1) == y).sum().item()
 
+                val_loss /= len(dataloader_val)
+                val_acc /= len(dataloader_val)
+
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+                best_epoch = epoch
                 best_model_weights = copy.deepcopy(model.state_dict())
 
             # some output
+            print(f"[{epoch:>2}] LR: {scheduler.get_last_lr()[0]:.6f}  "
+                  f"Best val acc so far: {best_val_acc:.5f} (epoch {best_epoch})")
             print(f"[{epoch:>2}] Train accuracy: {train_acc:.5f}")
             print(f"[{epoch:>2}] Validation accuracy: {val_acc:.5f}")
             print(f"[{epoch:>2}] Train loss: {train_loss:.5f}")
@@ -284,6 +294,7 @@ class Trainer(Test):
             eta = (epochs-1-epoch) * time_per_epoch
             print(f"[{epoch:>2}] Time: {time_past:.1f}s, Time-per-Epoch: {time_per_epoch:.1f}s, eta: {eta:.1f}s")
 
+        print(f"Best epoch: {best_epoch}/{epochs-1}, val acc: {best_val_acc:.5f}")
         model.load_state_dict(best_model_weights)
         return model
     

@@ -126,6 +126,9 @@ Most of your epoch time is probably spent decoding and resizing image files, not
 ### Step 3: fix the optimization:
 Decay the learning rate. With a constant LR the weights keep bouncing around at the end. Look up cosine annealing with a short warmup.
 Average the weights. An exponential moving average (EMA) of the weights over training usually generalises better than the final weights. Evaluate both and compare.
+
+1. Cosine annealing
+2. EMA of the weights (Exponential Moving Average of the weights): 
 Then train longer, since the schedule now ends cleanly.
 
 ### Step 4: knowledge distillation
