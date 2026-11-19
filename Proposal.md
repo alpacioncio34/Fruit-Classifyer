@@ -120,6 +120,8 @@ We will improve what the Net learns without making the training harder.
 ### Step 1: Measure properly : DONE
 Checking for validation acc in each epoch and keeping the best epoch, not the last one.
 
+**Done:** val acc checked every epoch, best epoch kept; loss/acc now averaged per image (was per batch); final clean train/val accuracy printed, same as `challenge_test.py`.
+
 ### Step 2: Cacheing data preprocessing (Perhaps this does not better our performance but gives us more time)
 Most of your epoch time is probably spent decoding and resizing image files, not training. The deterministic part of your transform (resize, centre crop) gives the same result every time, so compute it once, keep the 16×16 tensors in memory, and apply only the random part per epoch. This is what turns one hour into many experiments.
 
@@ -127,9 +129,9 @@ Most of your epoch time is probably spent decoding and resizing image files, not
 Decay the learning rate. With a constant LR the weights keep bouncing around at the end. Look up cosine annealing with a short warmup.
 Average the weights. An exponential moving average (EMA) of the weights over training usually generalises better than the final weights. Evaluate both and compare.
 
-1. Cosine annealing
-2. EMA of the weights (Exponential Moving Average of the weights): 
-Then train longer, since the schedule now ends cleanly.
+1. Cosine annealing: **DONE.** 3% linear warmup, then cosine decay down to 1% of LR, stepped every batch.
+2. EMA of the weights (Exponential Moving Average of the weights): **Implemented, pending run.** Decay 0.99 (~last 5-6 epochs), with warm-up; live and EMA val acc both printed each epoch; the best EMA weights are saved.
+Then train longer, since the schedule now ends cleanly. (EPOCH_NUM = 250.)
 
 ### Step 4: knowledge distillation
 

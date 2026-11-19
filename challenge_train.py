@@ -28,6 +28,9 @@ CLASSES = ["apple","avocado","banana","cherry","kiwi","mango","orange","pineappl
 USE_GPU = True
 LR = 0.001 # Default:0.001
 LAMBDA_REG = 0.01
+# EMA of the weights. None disables it. The EMA averages roughly the last 1/(1-decay) optimizer steps
+# (with 18 steps/epoch, 0.99 ~ last 100 steps ~ 5-6 epochs).
+EMA_DECAY = 0.99
 # Calculated through commented code in datatrain
 MEAN = [0.6492, 0.5511, 0.402 ]
 STD = [0.2646, 0.2748, 0.3047]
@@ -138,6 +141,55 @@ class Net(torch.nn.Module):
 
         return x
     
+class EMA:
+    '''
+        Exponential Moving Average of the weights.
+
+        Keeps a shadow copy of the model whose weights are a running average of the trained weights:
+            ema_w = decay * ema_w + (1 - decay) * w        (after every optimizer step)
+        BatchNorm running stats are averaged the same way, so they stay consistent with the averaged weights.
+        The shadow copy is a plain Net, so its state_dict has the same keys as the model and can be saved
+        and loaded by challenge_test.py without changes. It is only used during training, so it does not
+        count towards the parameter budget.
+    '''
+
+    def __init__(self, model, decay):
+        self.model = copy.deepcopy(model).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.decay = decay
+        self.num_updates = 0
+
+    @torch.no_grad()
+    def update(self, model):
+        self.num_updates += 1
+        # Warm-up: early in training the average would be dominated by the random initialization,
+        # so use a smaller decay at the start (1/11, 2/12, ... -> decay)
+        d = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        live = model.state_dict()
+        for name, ema_t in self.model.state_dict().items():
+            if ema_t.is_floating_point():
+                ema_t.lerp_(live[name], 1 - d)    # ema = d*ema + (1-d)*live
+            else:
+                ema_t.copy_(live[name])           # e.g. BatchNorm num_batches_tracked
+
+
+@torch.no_grad()
+def evaluate(model, dataloader, loss_fn, use_gpu):
+    '''Mean loss and accuracy over the whole dataset, in eval mode (no dropout / stochastic depth, BN running stats).'''
+    model.eval()
+    total_loss, correct, n = 0.0, 0, 0
+    for x, y in dataloader:
+        if use_gpu and torch.cuda.is_available():
+            x = x.cuda()
+            y = y.cuda()
+        y_pred = model(x)
+        total_loss += loss_fn(y_pred, y).item() * len(x)   # loss_fn returns the batch mean
+        correct += (y_pred.argmax(dim=1) == y).sum().item()
+        n += len(x)
+    return total_loss / n, correct / n
+
+
 class Trainer(Test):
     
     def __init__(self):
@@ -215,6 +267,9 @@ class Trainer(Test):
         if use_gpu and torch.cuda.is_available():
             model = model.cuda()
 
+        # EMA shadow model (created after .cuda() so it lives on the same device)
+        ema = EMA(model, EMA_DECAY) if EMA_DECAY is not None else None
+
         time_start = time.time()
         epochs = epoch_num
 
@@ -223,12 +278,9 @@ class Trainer(Test):
         best_model_weights = copy.deepcopy(model.state_dict())
 
         for epoch in tqdm.trange(epochs):
-            train_loss = 0
-            train_acc = 0
-            val_loss = 0
-            val_acc = 0
-            train_acc = 0
-            val_acc = 0
+            train_loss = 0.0
+            train_correct = 0
+            train_n = 0
 
             model.train()  # training mode (matters for layers such as dropout or batch norm)
             for x, y in dataloader_train:
@@ -248,55 +300,59 @@ class Trainer(Test):
                 # change parameters of the network
                 optimizer.step()
                 scheduler.step()
+                if ema is not None:
+                    ema.update(model)
 
                 # L is the mean over the batch, so weight it by the batch size
                 train_loss += L.item() * len(x)
-                train_acc += (y_pred.argmax(dim=1) == y).sum().item()
+                train_correct += (y_pred.argmax(dim=1) == y).sum().item()
+                train_n += len(x)
 
-            train_loss/=len(dataloader_train)
-            train_acc /= len(dataloader_train)
+            # Divide by the number of IMAGES, not the number of batches
+            train_loss /= train_n
+            train_acc = train_correct / train_n
 
             # Val evaluation in order to obtain the best model, not the last one
-            model.eval()
-            with torch.no_grad():
-                for x,y in dataloader_val:
-                    optimizer.zero_grad()
-                    # Move to GPU if GPU is available
-                    if use_gpu and torch.cuda.is_available():
-                        x = x.cuda()
-                        y = y.cuda()
+            val_loss, val_acc = evaluate(model, dataloader_val, loss, use_gpu)
+            if ema is not None:
+                ema_val_loss, ema_val_acc = evaluate(ema.model, dataloader_val, loss, use_gpu)
 
-                    y_pred = model(x)
-                    L = loss(y_pred,y)
-                    # Note: NO l.backward or optimizer.step since we are just using the model, not training it
-
-                    # L is the mean over the batch, so we weight is by the batch size
-                    val_loss += L.item() * len(x)
-                    val_acc += (y_pred.argmax(dim=1) == y).sum().item()
-
-                val_loss /= len(dataloader_val)
-                val_acc /= len(dataloader_val)
-
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            # Model selection: with EMA enabled we select (and save) the EMA weights
+            selected_model = ema.model if ema is not None else model
+            selected_acc = ema_val_acc if ema is not None else val_acc
+            if selected_acc > best_val_acc:
+                best_val_acc = selected_acc
                 best_epoch = epoch
-                best_model_weights = copy.deepcopy(model.state_dict())
+                best_model_weights = copy.deepcopy(selected_model.state_dict())
 
             # some output
             print(f"[{epoch:>2}] LR: {scheduler.get_last_lr()[0]:.6f}  "
                   f"Best val acc so far: {best_val_acc:.5f} (epoch {best_epoch})")
-            print(f"[{epoch:>2}] Train accuracy: {train_acc:.5f}")
-            print(f"[{epoch:>2}] Validation accuracy: {val_acc:.5f}")
-            print(f"[{epoch:>2}] Train loss: {train_loss:.5f}")
-            print(f"[{epoch:>2}] Validation loss: {val_loss:.5f}")
+            # NOTE: train acc/loss are measured on AUGMENTED images in TRAIN mode (dropout, stochastic depth),
+            # averaged while the weights change, so they are not comparable to challenge_test.py's "train"
+            print(f"[{epoch:>2}] Train accuracy (augmented, train mode): {train_acc:.5f}")
+            print(f"[{epoch:>2}] Train loss (augmented, train mode): {train_loss:.5f}")
+            print(f"[{epoch:>2}] Validation accuracy: {val_acc:.5f}   loss: {val_loss:.5f}")
+            if ema is not None:
+                print(f"[{epoch:>2}] EMA validation accuracy: {ema_val_acc:.5f}   loss: {ema_val_loss:.5f}")
             time_past = time.time() - time_start
             time_per_epoch = time_past / (epoch+1)
             eta = (epochs-1-epoch) * time_per_epoch
             print(f"[{epoch:>2}] Time: {time_past:.1f}s, Time-per-Epoch: {time_per_epoch:.1f}s, eta: {eta:.1f}s")
 
-        print(f"Best epoch: {best_epoch}/{epochs-1}, val acc: {best_val_acc:.5f}")
+        print(f"Last epoch val acc: live {val_acc:.5f}" + (f", EMA {ema_val_acc:.5f}" if ema is not None else ""))
+        print(f"Best epoch: {best_epoch}/{epochs-1}, val acc: {best_val_acc:.5f}" + (" (EMA weights)" if ema is not None else ""))
         model.load_state_dict(best_model_weights)
         return model
+
+    def final_report(self, model, use_gpu):
+        '''Clean accuracy (eval transform, eval mode): the same numbers challenge_test.py reports.'''
+        loss = torch.nn.CrossEntropyLoss()
+        for split, root in [("train", TRAIN_DATA_DIR), ("val", VAL_DATA_DIR)]:
+            data = torchvision.datasets.ImageFolder(root=root, transform=eval_transform)
+            loader = torch.utils.data.DataLoader(data, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+            _, acc = evaluate(model, loader, loss, use_gpu)
+            print(f"Final clean {split} accuracy: {acc:.3f}")
     
 if __name__ == "__main__":
     trainer = Trainer() 
@@ -316,3 +372,4 @@ if __name__ == "__main__":
     print(num_par)
 
     trainer.save_model(model)
+    trainer.final_report(model, USE_GPU)
