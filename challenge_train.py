@@ -44,7 +44,7 @@ train_transform = v2.Compose([
     v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=MEAN, std=STD),   # computed from training set
-    # v2.RandomErasing(p=0.5, scale=(0.02, 0.1)),  # optional, small patches
+    v2.RandomErasing(p=0.5, scale=(0.02, 0.1)),  # optional, small patches
 ])
 
 '''
