@@ -31,6 +31,12 @@ LAMBDA_REG = 0.01
 # EMA of the weights. None disables it. The EMA averages roughly the last 1/(1-decay) optimizer steps
 # (with 18 steps/epoch, 0.99 ~ last 100 steps ~ 5-6 epochs).
 EMA_DECAY = 0.99
+# Knowledge distillation. Teacher logits come from make_teacher.py (out-of-fold, so the teacher has not seen
+# the image it labels). Loss = ALPHA * CE(hard label) + (1-ALPHA) * T^2 * KL(teacher_T || student_T).
+DISTILL = True
+TEACHER_FILE = "teacher_logits.pt"
+TEMPERATURE = 4.0
+ALPHA = 0.3     # weight of the hard-label loss
 # Calculated through commented code in datatrain
 MEAN = [0.6492, 0.5511, 0.402 ]
 STD = [0.2646, 0.2748, 0.3047]
@@ -174,6 +180,31 @@ class EMA:
                 ema_t.copy_(live[name])           # e.g. BatchNorm num_batches_tracked
 
 
+class IndexedDataset(torch.utils.data.Dataset):
+    '''Wraps a dataset so each item is (x, y, idx); idx selects the row of the teacher logits.'''
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+        x, y = self.dataset[i]
+        return x, y, i
+
+
+def distillation_loss(student_logits, teacher_logits, y, T, alpha):
+    '''alpha * CE(hard) + (1-alpha) * T^2 * KL(teacher || student) at temperature T. T^2 keeps the soft-term gradient scale.'''
+    hard = torch.nn.functional.cross_entropy(student_logits, y)
+    soft = torch.nn.functional.kl_div(
+        torch.nn.functional.log_softmax(student_logits / T, dim=1),
+        torch.nn.functional.softmax(teacher_logits / T, dim=1),
+        reduction="batchmean",
+    ) * (T * T)
+    return alpha * hard + (1 - alpha) * soft
+
+
 @torch.no_grad()
 def evaluate(model, dataloader, loss_fn, use_gpu):
     '''Mean loss and accuracy over the whole dataset, in eval mode (no dropout / stochastic depth, BN running stats).'''
@@ -226,6 +257,12 @@ class Trainer(Test):
 
     def dataloaders(self):
         train_data = torchvision.datasets.ImageFolder(root=TRAIN_DATA_DIR,transform=train_transform)
+        if DISTILL:
+            saved = torch.load(TEACHER_FILE, weights_only=True)
+            assert saved["files"] == [p for p, _ in train_data.samples], \
+                "teacher_logits.pt does not match the train set (rerun make_teacher.py)"
+            self.teacher_logits = saved["logits"]
+            train_data = IndexedDataset(train_data)
         val_data = torchvision.datasets.ImageFolder(root=VAL_DATA_DIR,transform=eval_transform)
 
         train_dataloader = torch.utils.data.DataLoader(train_data,batch_size=BATCH_SIZE,shuffle=True,num_workers=2)
@@ -283,18 +320,28 @@ class Trainer(Test):
             train_n = 0
 
             model.train()  # training mode (matters for layers such as dropout or batch norm)
-            for x, y in dataloader_train:
+            for batch in dataloader_train:
+                if DISTILL:
+                    x, y, idx = batch
+                    t_logits = self.teacher_logits[idx]
+                else:
+                    x, y = batch
                 # delete previous gradient calculations
                 optimizer.zero_grad()
                 # move to GPU if GPU is available
                 if use_gpu and torch.cuda.is_available():
                     x = x.cuda()
                     y = y.cuda()
+                    if DISTILL:
+                        t_logits = t_logits.cuda()
 
                 # predict class logits for each image in the batch
                 y_pred = model(x)
-                # compute the loss (mean over the batch)
-                L = loss(y_pred, y)
+                # compute the loss (mean over the batch); with distillation it mixes hard and teacher soft labels
+                if DISTILL:
+                    L = distillation_loss(y_pred, t_logits, y, TEMPERATURE, ALPHA)
+                else:
+                    L = loss(y_pred, y)
                 # compute gradients
                 L.backward()
                 # change parameters of the network
@@ -372,4 +419,4 @@ if __name__ == "__main__":
     print(num_par)
 
     trainer.save_model(model)
-    trainer.final_report(model, USE_GPU)
+    trainer.final_report(model, USE_GPU)
