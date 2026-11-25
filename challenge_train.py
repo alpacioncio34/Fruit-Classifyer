@@ -14,6 +14,7 @@ import tqdm
 from torchvision.ops import StochasticDepth
 import copy
 import math
+import hashlib
 
 
 
@@ -22,6 +23,10 @@ import math
 TRAIN_DATA_DIR = "dataset/train/"
 VAL_DATA_DIR = "dataset/val/"
 BATCH_SIZE = 128
+# Input resolution (multiple of 16). 16 = original net; 64 = same parameters, the stem downsamples to 16x16.
+RES = 64
+# Random seed. Every run also keeps its own copy of the weights: model_r<RES>_s<SEED>_kd<0/1>.torch
+SEED = 0
 KERNEL_SIZE = 3
 EPOCH_NUM = 250
 CLASSES = ["apple","avocado","banana","cherry","kiwi","mango","orange","pineapple","strawberry","watermelon"]
@@ -41,40 +46,41 @@ ALPHA = 0.3     # weight of the hard-label loss
 MEAN = [0.6492, 0.5511, 0.402 ]
 STD = [0.2646, 0.2748, 0.3047]
 
-train_transform = v2.Compose([
-    v2.ToImage(),
-    v2.Resize(16),
-    v2.CenterCrop(16),
-    v2.RandomHorizontalFlip(p=0.5),
-    v2.RandomResizedCrop(16, scale=(0.85, 1.0), ratio=(0.9, 1.1), antialias=True),
-    v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-    v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(mean=MEAN, std=STD),   # computed from training set
-    v2.RandomErasing(p=0.5, scale=(0.02, 0.1)),  # optional, small patches
-])
+def make_transforms(res):
+    '''(deterministic part, random train part, eval part). The deterministic part is the same every epoch, so it is cached.'''
+    base = [v2.ToImage(), v2.Resize(res), v2.CenterCrop(res)]
+    norm = [v2.ToDtype(torch.float32, scale=True), v2.Normalize(mean=MEAN, std=STD)]
+    random_part = [
+        v2.RandomHorizontalFlip(p=0.5),
+        v2.RandomResizedCrop(res, scale=(0.85, 1.0), ratio=(0.9, 1.1), antialias=True),
+        v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        *norm,
+        v2.RandomErasing(p=0.5, scale=(0.02, 0.1)),
+    ]
+    return base, random_part, norm
 
-'''
-train_transform = v2.Compose([
-    v2.ToImage(),
-    v2.Resize(16),
-    v2.CenterCrop(16), # Not all images are squared
-    v2.RandomResizedCrop(16, scale=(0.6, 1.0), ratio=(0.85, 1.15), antialias=True),
-    v2.RandomAffine(degrees=10, translate=(0.1, 0.1)),
-    v2.RandomHorizontalFlip(0.5),  
-    v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
-    v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(mean=MEAN, std=STD),
-    v2.RandomErasing(p=0.5, scale=(0.02, 0.2), value=0),
-])
-'''
 
-eval_transform = v2.Compose([
-    v2.ToImage(),
-    v2.Resize(16),
-    v2.CenterCrop(16),
-    v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(mean=MEAN, std=STD),
-])
+class CachedDataset(torch.utils.data.Dataset):
+    '''Keeps the resized uint8 images in memory and applies only `transform` on access.'''
+
+    def __init__(self, root, base, transform):
+        folder = torchvision.datasets.ImageFolder(root=root, transform=v2.Compose(base))
+        self.samples = folder.samples
+        self.targets = folder.targets
+        self.images = torch.stack([x.as_subclass(torch.Tensor) for x, _ in folder])
+        self.transform = v2.Compose(transform)
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, i):
+        return self.transform(self.images[i]), self.targets[i]
+
+
+def file_hash(path):
+    with open(path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
 
 # Debugging class for sizes
 class PrintSize(torch.nn.Module):
@@ -114,13 +120,22 @@ class Net(torch.nn.Module):
         reuse the same width throughout, and use residual connections so the network trains easily and can be regularized with stochastic depth.
     '''
 
-    def __init__(self,dropout=0.2,sd_prob=0.1):
+    def __init__(self,dropout=0.2,sd_prob=0.1,res=RES):
         super().__init__()
 
+        # The stem brings any resolution down to 16x16, without adding parameters (stride + pooling)
+        assert res in (16, 32, 64, 128), "unsupported resolution"
+        stride = 2 if res >= 64 else 1
+        size = res // stride
+        downsample = []
+        while size > 16:
+            downsample.append(torch.nn.MaxPool2d(2))
+            size //= 2
         self.stem = torch.nn.Sequential(
-            torch.nn.Conv2d(3,16,3,padding=1,bias=False),
+            torch.nn.Conv2d(3,16,3,stride=stride,padding=1,bias=False),
             torch.nn.BatchNorm2d(16),
             torch.nn.ReLU(),
+            *downsample,
         )
 
         self.block1 = ResBlock(16,16,sd_prob/2) 
@@ -223,29 +238,29 @@ def evaluate(model, dataloader, loss_fn, use_gpu):
 
 class Trainer(Test):
     
-    def __init__(self):
+    def __init__(self, res=RES):
         super(Test, self).__init__()
+        self.res = res
 
 
     def create_model(self):
-        return Net(sd_prob=0.1,dropout=0.2)
+        return Net(sd_prob=0.1,dropout=0.2,res=self.res)
     
     
     def create_transform(self, inference=True):
-        if inference:
-            return eval_transform
-        return train_transform
+        base, random_part, eval_part = make_transforms(self.res)
+        return v2.Compose(base + (eval_part if inference else random_part))
     
 
-    def save_model(self, model):
-        torch.save(model.state_dict(), "model.torch")
+    def save_model(self, model, path="model.torch"):
+        torch.save(model.state_dict(), path)
 
     def compute_stats(self):
         # COMPUTING MEAN AND STD
         plain = v2.Compose([
             v2.ToImage(),
-            v2.Resize(16),
-            v2.CenterCrop(16),
+            v2.Resize(self.res),
+            v2.CenterCrop(self.res),
             v2.ToDtype(torch.float32, scale=True),   # no Normalization
         ])
         data = torchvision.datasets.ImageFolder(root=TRAIN_DATA_DIR, transform=plain)
@@ -256,17 +271,24 @@ class Trainer(Test):
         print("std:", X.std(axis=(0, 2, 3)).round(4))
 
     def dataloaders(self):
-        train_data = torchvision.datasets.ImageFolder(root=TRAIN_DATA_DIR,transform=train_transform)
+        base, random_part, eval_part = make_transforms(self.res)
+        train_data = CachedDataset(TRAIN_DATA_DIR, base, random_part)
+        train_hashes = {file_hash(p) for p, _ in train_data.samples}
         if DISTILL:
             saved = torch.load(TEACHER_FILE, weights_only=True)
             assert saved["files"] == [p for p, _ in train_data.samples], \
                 "teacher_logits.pt does not match the train set (rerun make_teacher.py)"
             self.teacher_logits = saved["logits"]
             train_data = IndexedDataset(train_data)
-        val_data = torchvision.datasets.ImageFolder(root=VAL_DATA_DIR,transform=eval_transform)
+        val_data = CachedDataset(VAL_DATA_DIR, base, eval_part)
+        # Val images that are byte-identical to a train image are left out, so they cannot drive epoch selection.
+        # final_report() still measures the full val split.
+        keep = [i for i, (p, _) in enumerate(val_data.samples) if file_hash(p) not in train_hashes]
+        print(f"Val: {len(keep)} images used, {len(val_data) - len(keep)} duplicates of train images left out")
+        val_data = torch.utils.data.Subset(val_data, keep)
 
-        train_dataloader = torch.utils.data.DataLoader(train_data,batch_size=BATCH_SIZE,shuffle=True,num_workers=2)
-        val_dataloader = torch.utils.data.DataLoader(val_data,batch_size=BATCH_SIZE,shuffle=True,num_workers=2)
+        train_dataloader = torch.utils.data.DataLoader(train_data,batch_size=BATCH_SIZE,shuffle=True,num_workers=0)
+        val_dataloader = torch.utils.data.DataLoader(val_data,batch_size=BATCH_SIZE,shuffle=False,num_workers=0)
 
         return train_data,val_data,train_dataloader,val_dataloader
 
@@ -388,7 +410,7 @@ class Trainer(Test):
             print(f"[{epoch:>2}] Time: {time_past:.1f}s, Time-per-Epoch: {time_per_epoch:.1f}s, eta: {eta:.1f}s")
 
         print(f"Last epoch val acc: live {val_acc:.5f}" + (f", EMA {ema_val_acc:.5f}" if ema is not None else ""))
-        print(f"Best epoch: {best_epoch}/{epochs-1}, val acc: {best_val_acc:.5f}" + (" (EMA weights)" if ema is not None else ""))
+        print(f"Best epoch: {best_epoch}/{epochs-1}, val acc WITHOUT duplicates: {best_val_acc:.5f}" + (" (EMA weights)" if ema is not None else ""))
         model.load_state_dict(best_model_weights)
         return model
 
@@ -396,13 +418,15 @@ class Trainer(Test):
         '''Clean accuracy (eval transform, eval mode): the same numbers challenge_test.py reports.'''
         loss = torch.nn.CrossEntropyLoss()
         for split, root in [("train", TRAIN_DATA_DIR), ("val", VAL_DATA_DIR)]:
-            data = torchvision.datasets.ImageFolder(root=root, transform=eval_transform)
-            loader = torch.utils.data.DataLoader(data, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+            data = torchvision.datasets.ImageFolder(root=root, transform=self.create_transform())
+            loader = torch.utils.data.DataLoader(data, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
             _, acc = evaluate(model, loader, loss, use_gpu)
-            print(f"Final clean {split} accuracy: {acc:.3f}")
+            print(f"Final clean {split} accuracy (full split, as challenge_test.py): {acc:.3f}")
     
 if __name__ == "__main__":
-    trainer = Trainer() 
+    torch.manual_seed(SEED)
+
+    trainer = Trainer()
     model = trainer.create_model()
 
     # trainer.compute_stats()
@@ -418,5 +442,6 @@ if __name__ == "__main__":
 
     print(num_par)
 
-    trainer.save_model(model)
-    trainer.final_report(model, USE_GPU)
+    trainer.save_model(model)     # model.torch: the one challenge_test.py evaluates
+    trainer.save_model(model, f"model_r{RES}_s{SEED}_kd{int(DISTILL)}.torch")   # copy that other configurations do not overwrite
+    trainer.final_report(model, USE_GPU)
