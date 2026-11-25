@@ -25,10 +25,12 @@ VAL_DATA_DIR = "dataset/val/"
 BATCH_SIZE = 128
 # Input resolution (multiple of 16). 16 = original net; 64 = same parameters, the stem downsamples to 16x16.
 RES = 64
-# Random seed. Every run also keeps its own copy of the weights: model_r<RES>_s<SEED>_kd<0/1>.torch
-SEED = 0
+# Random seed. Every run also keeps its own copy of the weights: model_r<RES>_s<SEED>_kd<0/1>_aug<0/1>.torch
+SEED = 1
+# Stronger train augmentation against overfitting. False = previous augmentation (with it use EPOCH_NUM = 250).
+STRONG_AUG = True
 KERNEL_SIZE = 3
-EPOCH_NUM = 250
+EPOCH_NUM = 400   # stronger augmentation needs longer training (was 250)
 CLASSES = ["apple","avocado","banana","cherry","kiwi","mango","orange","pineapple","strawberry","watermelon"]
 USE_GPU = True
 LR = 0.001 # Default:0.001
@@ -47,9 +49,22 @@ MEAN = [0.6492, 0.5511, 0.402 ]
 STD = [0.2646, 0.2748, 0.3047]
 
 def make_transforms(res):
-    '''(deterministic part, random train part, eval part). The deterministic part is the same every epoch, so it is cached.'''
+    '''(deterministic eval part, deterministic train part, random train part, eval part). The deterministic part is the same every epoch, so it is cached.'''
     base = [v2.ToImage(), v2.Resize(res), v2.CenterCrop(res)]
     norm = [v2.ToDtype(torch.float32, scale=True), v2.Normalize(mean=MEAN, std=STD)]
+    if STRONG_AUG:
+        # Random crops are cut from a larger cached image, so zoomed-in crops show real detail instead of upscaled pixels
+        big = res * 3 // 2
+        base_train = [v2.ToImage(), v2.Resize(big), v2.CenterCrop(big)]
+        random_part = [
+            v2.RandomHorizontalFlip(p=0.5),
+            v2.RandomRotation(15, interpolation=v2.InterpolationMode.BILINEAR, fill=255),   # fill: white corners
+            v2.RandomResizedCrop(res, scale=(0.5, 1.0), ratio=(0.8, 1.25), antialias=True),
+            v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.02),   # hue stays small: colour identifies fruit
+            *norm,
+            v2.RandomErasing(p=0.5, scale=(0.02, 0.15)),
+        ]
+        return base, base_train, random_part, norm
     random_part = [
         v2.RandomHorizontalFlip(p=0.5),
         v2.RandomResizedCrop(res, scale=(0.85, 1.0), ratio=(0.9, 1.1), antialias=True),
@@ -57,7 +72,7 @@ def make_transforms(res):
         *norm,
         v2.RandomErasing(p=0.5, scale=(0.02, 0.1)),
     ]
-    return base, random_part, norm
+    return base, base, random_part, norm
 
 
 class CachedDataset(torch.utils.data.Dataset):
@@ -248,8 +263,8 @@ class Trainer(Test):
     
     
     def create_transform(self, inference=True):
-        base, random_part, eval_part = make_transforms(self.res)
-        return v2.Compose(base + (eval_part if inference else random_part))
+        base, base_train, random_part, eval_part = make_transforms(self.res)
+        return v2.Compose(base + eval_part if inference else base_train + random_part)
     
 
     def save_model(self, model, path="model.torch"):
@@ -271,8 +286,8 @@ class Trainer(Test):
         print("std:", X.std(axis=(0, 2, 3)).round(4))
 
     def dataloaders(self):
-        base, random_part, eval_part = make_transforms(self.res)
-        train_data = CachedDataset(TRAIN_DATA_DIR, base, random_part)
+        base, base_train, random_part, eval_part = make_transforms(self.res)
+        train_data = CachedDataset(TRAIN_DATA_DIR, base_train, random_part)
         train_hashes = {file_hash(p) for p, _ in train_data.samples}
         if DISTILL:
             saved = torch.load(TEACHER_FILE, weights_only=True)
@@ -443,5 +458,5 @@ if __name__ == "__main__":
     print(num_par)
 
     trainer.save_model(model)     # model.torch: the one challenge_test.py evaluates
-    trainer.save_model(model, f"model_r{RES}_s{SEED}_kd{int(DISTILL)}.torch")   # copy that other configurations do not overwrite
+    trainer.save_model(model, f"model_r{RES}_s{SEED}_kd{int(DISTILL)}_aug{int(STRONG_AUG)}.torch")   # copy that other configurations do not overwrite
     trainer.final_report(model, USE_GPU)
