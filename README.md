@@ -25,7 +25,7 @@ input image            3 × 16 × 16
  Dropout
  Linear (16→10)        10             scores for each fruit class
 ```
-
+f
 ## Components
 
 ### 1. Stem: one convolution from 3 to 16 channels
