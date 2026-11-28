@@ -4,6 +4,12 @@
     This is an example implementation of what you have to submit in order
     to test your model on the "test" split.
 
+    One command does everything:   python challenge_train.py
+      1. builds the distillation soft labels (teacher_logits.pt) if they are missing or stale,
+      2. trains the network and saves model.torch,
+      3. prints the clean train/val accuracy.
+    Then  python challenge_test.py  evaluates model.torch exactly as the challenge does.
+
 """
 
 from challenge_test import Test
@@ -23,25 +29,45 @@ import hashlib
 TRAIN_DATA_DIR = "dataset/train/"
 VAL_DATA_DIR = "dataset/val/"
 BATCH_SIZE = 128
-# Input resolution (multiple of 16). 16 = original net; 64 = same parameters, the stem downsamples to 16x16.
+# Architecture, chosen by an ablation of 22 designs under 10k parameters:
+#   "ghost"  = GhostNet-style bottlenecks (winner), "resnet" = previous Mini-ResNet.
+ARCH = "ghost"
+# Input resolution. ghost: 64 (or 96: same weights count, a max-pool after the stem). resnet: 16/32/64/128.
 RES = 64
-# Random seed. Every run also keeps its own copy of the weights: model_r<RES>_s<SEED>_kd<0/1>_aug<0/1>.torch
 SEED = 1
-# Stronger train augmentation against overfitting. False = previous augmentation (with it use EPOCH_NUM = 250).
-STRONG_AUG = True
+# Train augmentation:
+#   "gpu_strong" = batch augmentation on the GPU used in the ablation (affine zoom/rotation/aspect, colour,
+#                  hue, grey, blur, noise, erasing). It was the largest single gain on distorted images.
+#   "torchvision_strong" / "torchvision_base" = previous per-image pipelines.
+AUG_MODE = "gpu_strong"
+STRONG_AUG = AUG_MODE != "torchvision_base"
 KERNEL_SIZE = 3
-EPOCH_NUM = 400   # stronger augmentation needs longer training (was 250)
+EPOCH_NUM = 600   # ablation: 600 beat 300 epochs (+1.6 clean val, +2.7 on distorted val)
 CLASSES = ["apple","avocado","banana","cherry","kiwi","mango","orange","pineapple","strawberry","watermelon"]
 USE_GPU = True
-LR = 0.001 # Default:0.001
+LR = 6e-3          # ablation setting (the Mini-ResNet used 1e-3)
+WEIGHT_DECAY = 0.02
+DROPOUT = 0.1
+# "last" = save the EMA weights of the last epoch (what the ablation measured; val is not used to pick weights).
+# "best" = previous behaviour: the epoch with the best val accuracy (optimistic val number).
+SELECT = "last"
 LAMBDA_REG = 0.01
 # EMA of the weights. None disables it. The EMA averages roughly the last 1/(1-decay) optimizer steps
 # (with 18 steps/epoch, 0.99 ~ last 100 steps ~ 5-6 epochs).
 EMA_DECAY = 0.99
-# Knowledge distillation. Teacher logits come from make_teacher.py (out-of-fold, so the teacher has not seen
-# the image it labels). Loss = ALPHA * CE(hard label) + (1-ALPHA) * T^2 * KL(teacher_T || student_T).
+# Knowledge distillation. Loss = ALPHA * CE(hard label) + (1-ALPHA) * T^2 * KL(teacher_T || student_T).
+# Teacher = frozen ImageNet-pretrained backbone + linear head; every train image is labelled by a head that was
+# NOT fitted on it (K-fold out-of-fold), so the teacher has not memorised it. Built automatically by
+# build_teacher_logits() and cached in TEACHER_FILE. The teacher is only used for training and does not count
+# towards the 10k parameter budget (check the challenge rules allow a pretrained teacher).
 DISTILL = True
 TEACHER_FILE = "teacher_logits.pt"
+TEACHER_BACKBONE = "convnext_tiny"   # torchvision ImageNet weights, downloaded on first use
+TEACHER_RES = 224
+TEACHER_FOLDS = 5
+TEACHER_HEAD_EPOCHS = 300
+TEACHER_HEAD_WD = 1e-3
+TEACHER_SEED = 0
 TEMPERATURE = 4.0
 ALPHA = 0.3     # weight of the hard-label loss
 # Calculated through commented code in datatrain
@@ -52,6 +78,10 @@ def make_transforms(res):
     '''(deterministic eval part, deterministic train part, random train part, eval part). The deterministic part is the same every epoch, so it is cached.'''
     base = [v2.ToImage(), v2.Resize(res), v2.CenterCrop(res)]
     norm = [v2.ToDtype(torch.float32, scale=True), v2.Normalize(mean=MEAN, std=STD)]
+    if AUG_MODE == "gpu_strong":
+        # uint8 images at 1.5x resolution; gpu_augment() does everything else on whole batches
+        big = res * 3 // 2
+        return base, [v2.ToImage(), v2.Resize(big), v2.CenterCrop(big)], [v2.Identity()], norm
     if STRONG_AUG:
         # Random crops are cut from a larger cached image, so zoomed-in crops show real detail instead of upscaled pixels
         big = res * 3 // 2
@@ -126,10 +156,128 @@ class ResBlock(torch.nn.Module):
         return torch.nn.functional.relu(out)
 
 
-class Net(torch.nn.Module):
+#   scale lo/hi, rotation (deg), p_rotation, log aspect range, jitter, hue (rad), p_grey, p_blur, noise std, p_noise, p_erase
+GPU_STRONG = (0.55, 1.5, 30, 0.7, 0.22, 0.4, 0.15, 0.07, 0.25, 0.06, 0.3, 0.5)
+
+
+def gpu_augment(x, res, params=GPU_STRONG):
+    '''Batch augmentation on the device of x (uint8, B x 3 x 1.5res x 1.5res) -> normalized float B x 3 x res x res.
+    Same code as experiments/2026-11-27/sweep/train.py (aug="strong").'''
+    F = torch.nn.functional
+    lo, hi, rot_d, p_rot, ar_r, j, hue, p_gray, p_blur, nz, p_nz, p_er = params
+    dev = x.device; B = len(x); R = res; x = x.float() / 255
+    r = lambda a, b: torch.rand(B, device=dev) * (b - a) + a
+    p = lambda q: torch.rand(B, device=dev) < q
+    mean = torch.tensor(MEAN, device=dev).view(1, 3, 1, 1); std = torch.tensor(STD, device=dev).view(1, 3, 1, 1)
+    # geometry: zoom, aspect, rotation, flip, shift; the white background is kept outside the image
+    s = torch.exp(r(math.log(lo), math.log(hi))); rot = r(-rot_d, rot_d) * math.pi / 180 * p(p_rot); ar = torch.exp(r(-ar_r, ar_r))
+    sx, sy = s * ar.sqrt(), s / ar.sqrt()
+    flip = p(0.5).float() * -2 + 1
+    tx = r(-1, 1) * (1 - sx).abs(); ty = r(-1, 1) * (1 - sy).abs()
+    M = torch.stack([torch.stack([flip * sx * rot.cos(), -sy * rot.sin(), tx], 1), torch.stack([flip * sx * rot.sin(), sy * rot.cos(), ty], 1)], 1)
+    g = F.affine_grid(M, [B, 3, R, R], align_corners=False)
+    x = 1 - F.grid_sample(1 - x, g, mode="bilinear", padding_mode="zeros", align_corners=False)
+    # colour: brightness, contrast, saturation, hue rotation, grey
+    u = lambda: r(1 - j, 1 + j).view(B, 1, 1, 1)
+    x = (x * u()).clamp(0, 1)
+    m = x.mean((1, 2, 3), keepdim=True); x = ((x - m) * u() + m).clamp(0, 1)
+    gray = (x * torch.tensor([0.299, 0.587, 0.114], device=dev).view(1, 3, 1, 1)).sum(1, keepdim=True); x = (gray + (x - gray) * u()).clamp(0, 1)
+    if hue:
+        h = r(-hue, hue) * p(0.5); c, sn = h.cos(), h.sin(); k = 1 / 3; q = math.sqrt(k)
+        a = c + (1 - c) * k; b = k * (1 - c) - q * sn; d = k * (1 - c) + q * sn
+        Rm = torch.stack([torch.stack([a, b, d], 1), torch.stack([d, a, b], 1), torch.stack([b, d, a], 1)], 1)
+        x = torch.einsum("bij,bjhw->bihw", Rm, x).clamp(0, 1)
+    if p_gray:
+        x = torch.where(p(p_gray).view(B, 1, 1, 1), x.mean(1, keepdim=True).expand_as(x), x)
+    # blur and noise
+    bl = p(p_blur)
+    if bl.any(): x[bl] = v2.functional.gaussian_blur(x[bl], [5, 5], [float(torch.rand(1)) + 0.5] * 2)
+    if p_nz: x = (x + torch.randn_like(x) * (r(0, nz) * p(p_nz)).view(B, 1, 1, 1)).clamp(0, 1)
+    x = (x - mean) / std
+    # random erasing (to 0 = the mean colour)
+    h = r(R / 8, R * 3 / 8).view(B, 1); w = r(R / 8, R * 3 / 8).view(B, 1)
+    y0 = torch.rand(B, 1, device=dev) * (R - h); x0 = torch.rand(B, 1, device=dev) * (R - w); t = torch.arange(R, device=dev).float().view(1, R)
+    rows = (t >= y0) & (t < y0 + h) & (torch.rand(B, 1, device=dev) < p_er); cols = (t >= x0) & (t < x0 + w)
+    return x.masked_fill((rows[:, :, None] & cols[:, None, :]).unsqueeze(1), 0.0)
+
+
+def conv_bn(i, o, k=3, s=1, groups=1, act=True):
+    '''Conv (no bias) + BatchNorm (+ SiLU).'''
+    layers = [torch.nn.Conv2d(i, o, k, s, k // 2, groups=groups, bias=False), torch.nn.BatchNorm2d(o)]
+    if act:
+        layers.append(torch.nn.SiLU())
+    return torch.nn.Sequential(*layers)
+
+
+class Ghost(torch.nn.Module):
+    '''Ghost module: a 1x1 conv makes half of the output channels, a cheap depthwise 3x3 makes the other half from them.'''
+
+    def __init__(self, i, o, act=True):
+        super().__init__()
+        h = o // 2
+        self.p = conv_bn(i, h, 1, act=act)
+        self.c = conv_bn(h, h, 3, 1, groups=h, act=act)
+
+    def forward(self, x):
+        y = self.p(x)
+        return torch.cat([y, self.c(y)], 1)
+
+
+class GhostBottleneck(torch.nn.Module):
+    '''Ghost (expand) -> [depthwise stride-2 conv] -> Ghost (project, linear). Residual when the shape is unchanged.'''
+
+    def __init__(self, i, e, o, stride=1):
+        super().__init__()
+        self.res = (i == o and stride == 1)
+        layers = [Ghost(i, e)]
+        if stride > 1:
+            layers.append(conv_bn(e, e, 3, stride, groups=e, act=False))
+        layers.append(Ghost(e, o, act=False))
+        self.f = torch.nn.Sequential(*layers)
+
+    def forward(self, x):
+        return x + self.f(x) if self.res else self.f(x)
+
+
+class Head(torch.nn.Module):
+    def __init__(self, c, dropout):
+        super().__init__()
+        self.d = torch.nn.Dropout(dropout)
+        self.l = torch.nn.Linear(c, len(CLASSES))
+
+    def forward(self, x):
+        return self.l(self.d(x.mean((2, 3))))
+
+
+class GhostNet(torch.nn.Sequential):
+    '''
+        ARCHITECTURE CHOSEN BY THE ABLATION: tiny GhostNet (9626 parameters).
+
+        Inverted-bottleneck design: cheap depthwise convolutions carry the spatial work, so the parameters go
+        into more channels and more blocks than a ResNet of the same size can afford.
+        64x64 input -> stem stride 2 (32x32) -> 2 bottlenecks at 16x16 -> 2 bottlenecks at 8x8 -> 1x1 conv -> head.
+        With res=96 a max-pool after the stem keeps the same feature-map sizes and the same parameters.
+        Same module layout as the ablation models, so their weights load with strict=True.
+    '''
+
+    def __init__(self, dropout=DROPOUT, res=RES):
+        assert res in (64, 96), "GhostNet supports res 64 or 96"
+        stem = [conv_bn(3, 14, 3, 2)] + ([torch.nn.MaxPool2d(2)] if res == 96 else [])
+        super().__init__(
+            *stem,
+            GhostBottleneck(14, 36, 16, 2),
+            GhostBottleneck(16, 52, 16),
+            GhostBottleneck(16, 52, 28, 2),
+            GhostBottleneck(28, 72, 28),
+            conv_bn(28, 44, 1),
+            Head(44, dropout),
+        )
+
+
+class MiniResNet(torch.nn.Module):
 
     '''
-        NEW ARCHITECTURE DESIGN: Mini-RESNET
+        PREVIOUS ARCHITECTURE DESIGN: Mini-RESNET
 
         The idea is to spend a tiny parameter budget as efficiently as possible: keep enough channels from the start to avoid losing information,
         reuse the same width throughout, and use residual connections so the network trains easily and can be regularized with stochastic depth.
@@ -176,7 +324,9 @@ class Net(torch.nn.Module):
         x = self.classifier(x)
 
         return x
-    
+
+
+
 class EMA:
     '''
         Exponential Moving Average of the weights.
@@ -224,6 +374,76 @@ class IndexedDataset(torch.utils.data.Dataset):
         return x, y, i
 
 
+def build_teacher_logits(train_dir=TRAIN_DATA_DIR, out_file=TEACHER_FILE):
+    '''Soft labels for distillation: {"logits": [N,10], "files": [N] paths} in ImageFolder order of train_dir.
+    Frozen ImageNet backbone features (image + mirrored image averaged), then a logistic-regression head per
+    fold; each image gets the logits of the head that did not see it. Runs once (a few minutes on a GPU).'''
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tf = v2.Compose([
+        v2.ToImage(), v2.Resize(TEACHER_RES), v2.CenterCrop(TEACHER_RES),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),   # ImageNet stats
+    ])
+    data = torchvision.datasets.ImageFolder(root=train_dir, transform=tf)
+    n_classes = len(data.classes)
+    with torch.random.fork_rng(devices=[]):          # own seed, leaves the training RNG untouched
+        torch.manual_seed(TEACHER_SEED)
+        weights = torchvision.models.get_model_weights(TEACHER_BACKBONE).DEFAULT
+        backbone = torchvision.models.get_model(TEACHER_BACKBONE, weights=weights)
+        backbone.classifier[-1] = torch.nn.Identity()     # keep the pooled features
+        backbone = backbone.eval().to(device)
+        # no loader workers: Docker's default 64 MB /dev/shm overflows with 224 px batches
+        loader = torch.utils.data.DataLoader(data, batch_size=32, shuffle=False, num_workers=0)
+        feats, labels = [], []
+        with torch.no_grad():
+            for x, y in tqdm.tqdm(loader, desc="teacher features"):
+                x = x.to(device)
+                feats.append(((backbone(x) + backbone(torch.flip(x, dims=[3]))) / 2).cpu())
+                labels.append(y)
+        X, y = torch.cat(feats), torch.cat(labels)
+        del backbone
+
+        # stratified folds: shuffle inside each class, deal the samples round-robin to the folds
+        fold = torch.empty(len(y), dtype=torch.long)
+        for c in range(n_classes):
+            idx = (y == c).nonzero().squeeze(1)
+            idx = idx[torch.randperm(len(idx))]
+            fold[idx] = torch.arange(len(idx)) % TEACHER_FOLDS
+
+        logits = torch.zeros(len(y), n_classes)
+        for k in range(TEACHER_FOLDS):
+            tr, te = fold != k, fold == k
+            mu, sd = X[tr].mean(0, keepdim=True), X[tr].std(0, keepdim=True) + 1e-6
+            head = torch.nn.Linear(X.shape[1], n_classes).to(device)
+            opt = torch.optim.AdamW(head.parameters(), lr=1e-2, weight_decay=TEACHER_HEAD_WD)
+            Xn, yt = ((X[tr] - mu) / sd).to(device), y[tr].to(device)
+            for _ in range(TEACHER_HEAD_EPOCHS):
+                opt.zero_grad()
+                torch.nn.functional.cross_entropy(head(Xn), yt).backward()
+                opt.step()
+            with torch.no_grad():
+                logits[te] = head(((X[te] - mu) / sd).to(device)).cpu()
+            print(f"teacher fold {k}: out-of-fold acc {(logits[te].argmax(1) == y[te]).float().mean():.4f}")
+    print(f"Teacher out-of-fold train acc: {(logits.argmax(1) == y).float().mean():.4f}")
+    saved = {"logits": logits, "files": [p for p, _ in data.samples]}
+    torch.save(saved, out_file)
+    return saved
+
+
+def load_teacher_logits(files):
+    '''Cached teacher logits for exactly these train files; rebuilt when missing or made for another train set.'''
+    try:
+        saved = torch.load(TEACHER_FILE, weights_only=True)
+        if saved["files"] == files:
+            return saved["logits"]
+        print(f"{TEACHER_FILE} was made for a different train set: rebuilding it")
+    except FileNotFoundError:
+        print(f"{TEACHER_FILE} not found: building the teacher soft labels (runs once)")
+    saved = build_teacher_logits()
+    assert saved["files"] == files
+    return saved["logits"]
+
+
 def distillation_loss(student_logits, teacher_logits, y, T, alpha):
     '''alpha * CE(hard) + (1-alpha) * T^2 * KL(teacher || student) at temperature T. T^2 keeps the soft-term gradient scale.'''
     hard = torch.nn.functional.cross_entropy(student_logits, y)
@@ -259,7 +479,9 @@ class Trainer(Test):
 
 
     def create_model(self):
-        return Net(sd_prob=0.1,dropout=0.2,res=self.res)
+        if ARCH == "ghost":
+            return GhostNet(dropout=DROPOUT, res=self.res)
+        return MiniResNet(sd_prob=0.1,dropout=0.2,res=self.res)
     
     
     def create_transform(self, inference=True):
@@ -290,10 +512,7 @@ class Trainer(Test):
         train_data = CachedDataset(TRAIN_DATA_DIR, base_train, random_part)
         train_hashes = {file_hash(p) for p, _ in train_data.samples}
         if DISTILL:
-            saved = torch.load(TEACHER_FILE, weights_only=True)
-            assert saved["files"] == [p for p, _ in train_data.samples], \
-                "teacher_logits.pt does not match the train set (rerun make_teacher.py)"
-            self.teacher_logits = saved["logits"]
+            self.teacher_logits = load_teacher_logits([p for p, _ in train_data.samples])
             train_data = IndexedDataset(train_data)
         val_data = CachedDataset(VAL_DATA_DIR, base, eval_part)
         # Val images that are byte-identical to a train image are left out, so they cannot drive epoch selection.
@@ -319,7 +538,7 @@ class Trainer(Test):
 
         optimizer = torch.optim.AdamW(
             [
-                {"params": decay,    "weight_decay": 5e-2},
+                {"params": decay,    "weight_decay": WEIGHT_DECAY},
                 {"params": no_decay, "weight_decay": 0.0},
             ],
             lr=LR,
@@ -371,6 +590,8 @@ class Trainer(Test):
                     y = y.cuda()
                     if DISTILL:
                         t_logits = t_logits.cuda()
+                if AUG_MODE == "gpu_strong":
+                    x = gpu_augment(x, self.res)
 
                 # predict class logits for each image in the batch
                 y_pred = model(x)
@@ -426,7 +647,12 @@ class Trainer(Test):
 
         print(f"Last epoch val acc: live {val_acc:.5f}" + (f", EMA {ema_val_acc:.5f}" if ema is not None else ""))
         print(f"Best epoch: {best_epoch}/{epochs-1}, val acc WITHOUT duplicates: {best_val_acc:.5f}" + (" (EMA weights)" if ema is not None else ""))
-        model.load_state_dict(best_model_weights)
+        if SELECT == "last":
+            print("Saving the last-epoch " + ("EMA " if ema is not None else "") + "weights (SELECT = 'last')")
+            if ema is not None:
+                model.load_state_dict(ema.model.state_dict())
+        else:
+            model.load_state_dict(best_model_weights)
         return model
 
     def final_report(self, model, use_gpu):
@@ -458,5 +684,4 @@ if __name__ == "__main__":
     print(num_par)
 
     trainer.save_model(model)     # model.torch: the one challenge_test.py evaluates
-    trainer.save_model(model, f"model_r{RES}_s{SEED}_kd{int(DISTILL)}_aug{int(STRONG_AUG)}.torch")   # copy that other configurations do not overwrite
     trainer.final_report(model, USE_GPU)
